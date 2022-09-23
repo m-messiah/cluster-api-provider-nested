@@ -121,8 +121,21 @@ func (mpn *Native) UpgradeVirtualCluster(ctx context.Context, vc *tenancyv1alpha
 	return mpn.applyVirtualCluster(ctx, cv, vc, false)
 }
 
+// fetchVCNodeSelector returns VirtualClusterNodeSelector if it exists or empty object to skip selectors
+func (mpn *Native) fetchVCNodeSelector(ctx context.Context, vc *tenancyv1alpha1.VirtualCluster) tenancyv1alpha1.VirtualClusterNodeSelector {
+	vcNodeSelectorObjectKey := client.ObjectKey{Name: vc.Name}
+	vcNodeSelector := tenancyv1alpha1.VirtualClusterNodeSelector{}
+	if err := mpn.Get(ctx, vcNodeSelectorObjectKey, &vcNodeSelector); err != nil {
+		// Desired VirtualClusterNodeSelector is not found, but it is ok, return empty object
+		return tenancyv1alpha1.VirtualClusterNodeSelector{Spec: tenancyv1alpha1.VirtualClusterNodeSelectorSpec{}}
+	}
+	return vcNodeSelector
+}
+
 func (mpn *Native) applyVirtualCluster(ctx context.Context, cv *tenancyv1alpha1.ClusterVersion, vc *tenancyv1alpha1.VirtualCluster, applyETCD bool) error {
 	var err error
+	vcNodeSelector := mpn.fetchVCNodeSelector(ctx, vc)
+
 	isClusterIP := cv.Spec.APIServer.Service != nil && cv.Spec.APIServer.Service.Spec.Type == corev1.ServiceTypeClusterIP
 	// if ClusterIP, have to update API Server ahead of time to lay it down in the PKI
 	if isClusterIP {
@@ -143,21 +156,21 @@ func (mpn *Native) applyVirtualCluster(ctx context.Context, cv *tenancyv1alpha1.
 
 	// 3. deploy etcd if defined
 	if applyETCD {
-		err = mpn.deployComponent(ctx, vc, cv.Spec.ETCD, clusterCAGroup)
+		err = mpn.deployComponent(ctx, vc, cv.Spec.ETCD, clusterCAGroup, vcNodeSelector)
 		if err != nil {
 			return err
 		}
 	}
 
 	// 4. deploy apiserver (must be defined always)
-	err = mpn.deployComponent(ctx, vc, cv.Spec.APIServer, clusterCAGroup)
+	err = mpn.deployComponent(ctx, vc, cv.Spec.APIServer, clusterCAGroup, vcNodeSelector)
 	if err != nil {
 		return err
 	}
 
 	// 5. deploy controller-manager if defined
 	if cv.Spec.ControllerManager != nil {
-		err = mpn.deployComponent(ctx, vc, cv.Spec.ControllerManager, clusterCAGroup)
+		err = mpn.deployComponent(ctx, vc, cv.Spec.ControllerManager, clusterCAGroup, vcNodeSelector)
 		if err != nil {
 			return err
 		}
@@ -230,10 +243,26 @@ func complementCtrlMgrTemplate(vcns string, ctrlMgrBdl *tenancyv1alpha1.Stateful
 	ctrlMgrBdl.StatefulSet.Spec.Template.SetAnnotations(annotations)
 }
 
+func complementTemplateWithNodeSelector(ssBdl *tenancyv1alpha1.StatefulSetSvcBundle, vcNodeSelector tenancyv1alpha1.VirtualClusterNodeSelector) {
+	if vcNodeSelector.Spec.Tolerations != nil {
+		ssBdl.StatefulSet.Spec.Template.Spec.Tolerations = append(ssBdl.StatefulSet.Spec.Template.Spec.Tolerations, vcNodeSelector.Spec.Tolerations...)
+	}
+	if vcNodeSelector.Spec.NodeSelector != nil {
+		nodeSelectors := ssBdl.StatefulSet.Spec.Template.Spec.NodeSelector
+		if nodeSelectors == nil {
+			nodeSelectors = make(map[string]string)
+		}
+		for key, value := range vcNodeSelector.Spec.NodeSelector {
+			nodeSelectors[key] = value
+		}
+		ssBdl.StatefulSet.Spec.Template.Spec.NodeSelector = nodeSelectors
+	}
+}
+
 // deployComponent deploys control plane component in namespace vcName based on the given StatefulSet
 // and Service Bundle ssBdl
 // the method also adds annotations with certificates hashes to trigger pod recreation if certificates were changed
-func (mpn *Native) deployComponent(ctx context.Context, vc *tenancyv1alpha1.VirtualCluster, ssBdl *tenancyv1alpha1.StatefulSetSvcBundle, clusterCAGroup *vcpki.ClusterCAGroup) error {
+func (mpn *Native) deployComponent(ctx context.Context, vc *tenancyv1alpha1.VirtualCluster, ssBdl *tenancyv1alpha1.StatefulSetSvcBundle, clusterCAGroup *vcpki.ClusterCAGroup, vcNodeSelector tenancyv1alpha1.VirtualClusterNodeSelector) error {
 	mpn.Log.Info("deploying StatefulSet for control plane component", "component", ssBdl.Name)
 
 	ns := conversion.ToClusterKey(vc)
@@ -248,6 +277,8 @@ func (mpn *Native) deployComponent(ctx context.Context, vc *tenancyv1alpha1.Virt
 	default:
 		return fmt.Errorf("try to deploy unknown component: %s", ssBdl.Name)
 	}
+
+	complementTemplateWithNodeSelector(ssBdl, vcNodeSelector)
 
 	err := mpn.Patch(ctx, ssBdl.StatefulSet, client.Apply, patchOptions)
 	if err != nil {
